@@ -1,0 +1,81 @@
+<# 
+.SYNOPSIS
+    Lists Azure SQL Managed Instances with failover group details.
+
+.DESCRIPTION
+    Outputs a table with:
+        InstanceName, SubscriptionName, Region,
+        FailoverGroupConfigured (Yes/No),
+        PrimaryServerName, SecondaryServerName, SecondaryRegion
+
+.NOTES
+    Requires Az PowerShell module.
+#>
+
+# Connect to Azure (interactive if not already signed in)
+connect-azaccount
+
+# Retrieve all subscriptions
+$subscriptions = Get-AzSubscription
+
+$results = @()
+
+foreach ($sub in $subscriptions) {
+    Set-AzContext -SubscriptionId $sub.Id | Out-Null
+
+    # Get all Managed Instances in this subscription
+    $managedInstances = Get-AzSqlInstance
+
+    # Get all Managed Instance failover groups in this subscription
+    # (resource type: Microsoft.Sql/managedInstances/failoverGroups)
+    $failoverGroups = Get-AzResource -ResourceType "Microsoft.Sql/managedInstances/failoverGroups" -ErrorAction SilentlyContinue
+
+    foreach ($mi in $managedInstances) {
+
+        # Default values when no failover group is configured
+        $fgConfigured    = "No"
+        $primaryName     = ""
+        $secondaryName   = ""
+        $secondaryRegion = ""
+
+        # Find if this instance participates in any failover group
+        $miFailover = $failoverGroups | Where-Object {
+            ($_.Properties.partnerServers.instanceName -eq $mi.Name) -or
+            ($_.Name -like "*$($mi.Name)*")
+        }
+
+        if ($miFailover) {
+            # Mark as configured and extract details
+            $fgConfigured  = "Yes"
+
+            # Each failover group has a "properties.partnerServers" array
+            $partners = $miFailover.Properties.partnerServers
+            # The current MI is either the primary or secondary
+            foreach ($partner in $partners) {
+                if ($partner.instanceName -ne $mi.Name) {
+                    $secondaryName   = $partner.instanceName
+                    $secondaryRegion = $partner.location
+                }
+            }
+
+            # Primary server name is the failover group parent (the MI itself)
+            $primaryName = $mi.Name
+        }
+
+        $results += [pscustomobject]@{
+            InstanceName           = $mi.Name
+            SubscriptionName       = $sub.Name
+            Region                 = $mi.Location
+            FailoverGroupConfigured= $fgConfigured
+            PrimaryServerName      = $primaryName
+            SecondaryServerName    = $secondaryName
+            SecondaryRegion        = $secondaryRegion
+        }
+    }
+}
+
+# Display results in a table
+$results | Format-Table -AutoSize
+
+# Optional: Export to CSV
+# $results | Export-Csv -Path ".\SqlManagedInstance_FailoverReport.csv" -NoTypeInformation
