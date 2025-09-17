@@ -1,44 +1,33 @@
 <# 
 .SYNOPSIS
-    Azure SQL Managed Instance Inventory with flexible subscription filter.
+    Azure SQL Managed Instance Inventory with Failover Group details.
 
 .DESCRIPTION
     Outputs a table with:
         InstanceName, SubscriptionName, Region,
         vCores, StorageGB, MaintenanceWindow,
         FailoverGroupConfigured (Yes/No),
-        PrimaryServerName, SecondaryServerName, SecondaryRegion
-
-    Subscription filter options:
-        • Tag name and value
-        • Specific subscription names (hard-coded)
-        • Text file containing subscription names (optional)
+        PrimaryServerName, SecondaryServerName, SecondaryRegion,
+        FailoverPolicyType (Microsoft Managed / Customer Managed),
+        GracePeriodWithDataLossHours
 
 .NOTES
     Requires Az PowerShell modules: Az.Sql, Az.Resources, Az.Maintenance
 #>
 
 # ---------- 1. Connect to Azure ----------
-
-connect-AZAccount
+Connect-AzAccount
 
 # ---------- 2. Retrieve all subscriptions ----------
 $allSubscriptions = Get-AzSubscription
 
 # ---------- 3. Filter subscriptions ----------
-
-# Option 1: Filter by tag (example)
 $tagName  = "Environment"
 $tagValue = "Production"
-
-# Option 2: Filter by specific subscription names (hard-coded)
-$specificSubscriptions = @("HEMAZURESUBSCRIPTION")
-
-# Option 3: Optional – Filter by subscription names from a text file
-# Uncomment the line below and provide the path to your text file
+$specificSubscriptions = @("subscription1")
+# Optional: Uncomment to read subscription list from text file
 # $specificSubscriptions = Get-Content -Path "C:\Scripts\SubscriptionList.txt"
 
-# Null-safe filtering
 $filteredSubscriptions = $allSubscriptions | Where-Object {
     ($_.Tags -ne $null -and $_.Tags.ContainsKey($tagName) -and $_.Tags[$tagName] -eq $tagValue) -or
     ($specificSubscriptions -contains $_.Name)
@@ -52,31 +41,28 @@ $results = @()
 foreach ($sub in $filteredSubscriptions) {
     Set-AzContext -SubscriptionId $sub.Id | Out-Null
 
-    # Import required modules
     Import-Module Az.Sql -ErrorAction Stop
     Import-Module Az.Resources -ErrorAction Stop
     Import-Module Az.Maintenance -ErrorAction SilentlyContinue
 
-    # Get all Managed Instances
     $managedInstances = Get-AzSqlInstance
-
-    # Get all Managed Instance failover groups
     $failoverGroups = Get-AzResource -ResourceType "Microsoft.Sql/managedInstances/failoverGroups" -ErrorAction SilentlyContinue
 
     foreach ($mi in $managedInstances) {
 
-        # ----- Extract Instance Name from ARM ID (reliable) -----
         $instanceName = ($mi.Id -split '/')[-1]
 
-        # ----- Default failover group values -----
-        $fgConfigured    = "No"
-        $primaryName     = ""
-        $secondaryName   = ""
-        $secondaryRegion = ""
+        # Default values
+        $fgConfigured        = "No"
+        $primaryName         = ""
+        $secondaryName       = ""
+        $secondaryRegion     = ""
+        $failoverPolicyType  = ""
+        $gracePeriodHours    = ""
 
-        # ----- Failover group check -----
+        # Check for Failover Groups
         $miFailover = $failoverGroups | Where-Object {
-            ($_.Properties.partnerServers.instanceName -eq $instanceName) -or
+            ($_.Properties.partnerServers.instanceName -contains $instanceName) -or
             ($_.Name -like "*$($instanceName)*")
         }
 
@@ -90,13 +76,27 @@ foreach ($sub in $filteredSubscriptions) {
                 }
             }
             $primaryName = $instanceName
+
+            # Extract Failover Policy & Grace Period
+            $fgProperties = $miFailover.Properties | ConvertTo-Json | ConvertFrom-Json
+            if ($fgProperties.readWriteEndpoint) {
+                $policy = $fgProperties.readWriteEndpoint.failoverPolicy
+                $grace  = $fgProperties.readWriteEndpoint.failoverWithDataLossGracePeriodHours
+
+                switch ($policy) {
+                    "Automatic" { $failoverPolicyType = "Microsoft Managed" }
+                    "Manual"    { $failoverPolicyType = "Customer Managed" }
+                    default     { $failoverPolicyType = $policy }
+                }
+                $gracePeriodHours = $grace
+            }
         }
 
-        # ----- vCore and storage -----
+        # vCores and Storage
         $vCores    = $mi.VCores
         $storageGB = [math]::Round($mi.StorageSizeInGB,0)
 
-        # ----- Maintenance Window -----
+        # Maintenance Window
         $maintenanceWindow = ""
         if ($mi.MaintenanceConfigurationId) {
             try {
@@ -109,28 +109,43 @@ foreach ($sub in $filteredSubscriptions) {
             }
         }
 
-        # ----- Build result object -----
+        # Build result object
         $results += [pscustomobject]@{
-            InstanceName            = $instanceName
-            SubscriptionName        = $sub.Name
-            Region                  = $mi.Location
-            vCores                  = $vCores
-            StorageGB               = $storageGB
-            MaintenanceWindow       = $maintenanceWindow
-            FailoverGroupConfigured = $fgConfigured
-            PrimaryServerName       = $primaryName
-            SecondaryServerName     = $secondaryName
-            SecondaryRegion         = $secondaryRegion
+            InstanceName                  = $instanceName
+            SubscriptionName              = $sub.Name
+            Region                        = $mi.Location
+            vCores                        = $vCores
+            StorageGB                     = $storageGB
+            MaintenanceWindow             = $maintenanceWindow
+            FailoverGroupConfigured       = $fgConfigured
+            PrimaryServerName             = $primaryName
+            SecondaryServerName           = $secondaryName
+            SecondaryRegion               = $secondaryRegion
+            FailoverPolicyType            = $failoverPolicyType
+            GracePeriodWithDataLossHours  = $gracePeriodHours
         }
     }
 }
 
-# ---------- 5. Display results ----------
-$results | Format-Table -AutoSize
+# ---------- 5. Display results reliably in console ----------
 
-# ---------- 6. Export to timestamped CSV ----------
+# Print header
+Write-Host ("{0,-25} {1,-25} {2,-15} {3,5} {4,8} {5,-30} {6,-5} {7,-25} {8,-25} {9,-15} {10,-20} {11,5}" -f `
+    "InstanceName","SubscriptionName","Region","vCores","StorageGB","MaintenanceWindow", `
+    "FG","Primary","Secondary","SecRegion","FGType","Grace(H)")
+Write-Host ("-"*200)
+
+# Print each row
+foreach ($r in $results) {
+    Write-Host ("{0,-25} {1,-25} {2,-15} {3,5} {4,8} {5,-30} {6,-5} {7,-25} {8,-25} {9,-15} {10,-20} {11,5}" -f `
+        $r.InstanceName, $r.SubscriptionName, $r.Region, $r.vCores, $r.StorageGB, $r.MaintenanceWindow, `
+        $r.FailoverGroupConfigured, $r.PrimaryServerName, $r.SecondaryServerName, $r.SecondaryRegion, `
+        $r.FailoverPolicyType, $r.GracePeriodWithDataLossHours)
+}
+
+# ---------- 6. Export to CSV ----------
 $timestamp = Get-Date -Format "yyyy-MM-dd_HHmm"
-$csvPath   = "F:\Hemanth\SqlManagedInstance_Inventory_Filtered_$timestamp.csv"
+$csvPath   = "C:\TEST\SqlManagedInstance_Inventory_Filtered_$timestamp.csv"
 
 $results | Export-Csv -Path $csvPath -NoTypeInformation
 Write-Host "`nReport exported to: $csvPath" -ForegroundColor Green
