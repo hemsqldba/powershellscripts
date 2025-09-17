@@ -1,0 +1,136 @@
+<# 
+.SYNOPSIS
+    Azure SQL Managed Instance Inventory with flexible subscription filter.
+
+.DESCRIPTION
+    Outputs a table with:
+        InstanceName, SubscriptionName, Region,
+        vCores, StorageGB, MaintenanceWindow,
+        FailoverGroupConfigured (Yes/No),
+        PrimaryServerName, SecondaryServerName, SecondaryRegion
+
+    Subscription filter options:
+        • Tag name and value
+        • Specific subscription names (hard-coded)
+        • Text file containing subscription names (optional)
+
+.NOTES
+    Requires Az PowerShell modules: Az.Sql, Az.Resources, Az.Maintenance
+#>
+
+# ---------- 1. Connect to Azure ----------
+
+connect-AZAccount
+
+# ---------- 2. Retrieve all subscriptions ----------
+$allSubscriptions = Get-AzSubscription
+
+# ---------- 3. Filter subscriptions ----------
+
+# Option 1: Filter by tag (example)
+$tagName  = "Environment"
+$tagValue = "Production"
+
+# Option 2: Filter by specific subscription names (hard-coded)
+$specificSubscriptions = @("HEMAZURESUBSCRIPTION")
+
+# Option 3: Optional – Filter by subscription names from a text file
+# Uncomment the line below and provide the path to your text file
+# $specificSubscriptions = Get-Content -Path "C:\Scripts\SubscriptionList.txt"
+
+# Null-safe filtering
+$filteredSubscriptions = $allSubscriptions | Where-Object {
+    ($_.Tags -ne $null -and $_.Tags.ContainsKey($tagName) -and $_.Tags[$tagName] -eq $tagValue) -or
+    ($specificSubscriptions -contains $_.Name)
+}
+
+Write-Host "Found $($filteredSubscriptions.Count) subscriptions after applying filters." -ForegroundColor Cyan
+
+$results = @()
+
+# ---------- 4. Loop through filtered subscriptions ----------
+foreach ($sub in $filteredSubscriptions) {
+    Set-AzContext -SubscriptionId $sub.Id | Out-Null
+
+    # Import required modules
+    Import-Module Az.Sql -ErrorAction Stop
+    Import-Module Az.Resources -ErrorAction Stop
+    Import-Module Az.Maintenance -ErrorAction SilentlyContinue
+
+    # Get all Managed Instances
+    $managedInstances = Get-AzSqlInstance
+
+    # Get all Managed Instance failover groups
+    $failoverGroups = Get-AzResource -ResourceType "Microsoft.Sql/managedInstances/failoverGroups" -ErrorAction SilentlyContinue
+
+    foreach ($mi in $managedInstances) {
+
+        # ----- Extract Instance Name from ARM ID (reliable) -----
+        $instanceName = ($mi.Id -split '/')[-1]
+
+        # ----- Default failover group values -----
+        $fgConfigured    = "No"
+        $primaryName     = ""
+        $secondaryName   = ""
+        $secondaryRegion = ""
+
+        # ----- Failover group check -----
+        $miFailover = $failoverGroups | Where-Object {
+            ($_.Properties.partnerServers.instanceName -eq $instanceName) -or
+            ($_.Name -like "*$($instanceName)*")
+        }
+
+        if ($miFailover) {
+            $fgConfigured = "Yes"
+            $partners = $miFailover.Properties.partnerServers
+            foreach ($partner in $partners) {
+                if ($partner.instanceName -ne $instanceName) {
+                    $secondaryName   = $partner.instanceName
+                    $secondaryRegion = $partner.location
+                }
+            }
+            $primaryName = $instanceName
+        }
+
+        # ----- vCore and storage -----
+        $vCores    = $mi.VCores
+        $storageGB = [math]::Round($mi.StorageSizeInGB,0)
+
+        # ----- Maintenance Window -----
+        $maintenanceWindow = ""
+        if ($mi.MaintenanceConfigurationId) {
+            try {
+                $maint = Get-AzMaintenanceConfiguration -ResourceId $mi.MaintenanceConfigurationId -ErrorAction SilentlyContinue
+                if ($maint) {
+                    $maintenanceWindow = "$($maint.MaintenanceScope) : $($maint.StartDate) ($($maint.Duration))"
+                }
+            } catch {
+                $maintenanceWindow = "N/A"
+            }
+        }
+
+        # ----- Build result object -----
+        $results += [pscustomobject]@{
+            InstanceName            = $instanceName
+            SubscriptionName        = $sub.Name
+            Region                  = $mi.Location
+            vCores                  = $vCores
+            StorageGB               = $storageGB
+            MaintenanceWindow       = $maintenanceWindow
+            FailoverGroupConfigured = $fgConfigured
+            PrimaryServerName       = $primaryName
+            SecondaryServerName     = $secondaryName
+            SecondaryRegion         = $secondaryRegion
+        }
+    }
+}
+
+# ---------- 5. Display results ----------
+$results | Format-Table -AutoSize
+
+# ---------- 6. Export to timestamped CSV ----------
+$timestamp = Get-Date -Format "yyyy-MM-dd_HHmm"
+$csvPath   = "F:\Hemanth\SqlManagedInstance_Inventory_Filtered_$timestamp.csv"
+
+$results | Export-Csv -Path $csvPath -NoTypeInformation
+Write-Host "`nReport exported to: $csvPath" -ForegroundColor Green
